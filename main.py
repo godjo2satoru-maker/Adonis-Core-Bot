@@ -12,15 +12,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
+from aiogram.enums import ChatAction, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
     BusinessConnection,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageOriginUser,
 )
 from google import genai
 from google.genai import types as genai_types
@@ -56,7 +58,7 @@ GEMINI_KEYS: Dict[int, str] = {
     3: os.getenv("GEMINI_KEY_3", "").strip(),
 }
 
-# 3 основных слота равномерно распределены по 3 ключам (+ автопереключение при 429)
+# 3 основных слота равномерно распределены по 3 ключам (+ автопереключение при 429/503)
 DEFAULT_AI_SLOTS: Dict[str, Dict[str, Any]] = {
     "tgk": {
         "title": "ТГК (посты)",
@@ -121,9 +123,47 @@ SECRET_LEAK_RE = re.compile(
     r"(AQ\.[A-Za-z0-9_\-]{10,}|AIza[A-Za-z0-9_\-]{10,}|\b\d{7,12}:[A-Za-z0-9_\-]{20,}\b)"
 )
 
+ALLOWED_TG_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler|a)>"
+    r"|<blockquote\s+expandable>"
+    r"|<a\s+href=[\"']https?://[^\"'\s<>]+[\"']>",
+    re.IGNORECASE,
+)
+
+FENCED_CODE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n?(.*?)```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+MD_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+
+# Теги реальных действий, которые модель может вызывать в личном Пульте владельца
+ACTION_PUBLISH_RE = re.compile(
+    r"<POST_PUBLISH(?:\s+photo=[\"']?(1|true|yes)[\"']?)?>\s*(.*?)\s*</POST_PUBLISH>",
+    re.DOTALL | re.IGNORECASE,
+)
+ACTION_PUBLISH_LAST_RE = re.compile(r"<POST_PUBLISH_LAST\s*/?>", re.IGNORECASE)
+ACTION_DRAFT_RE = re.compile(
+    r"<POST_DRAFT(?:\s+photo=[\"']?(1|true|yes)[\"']?)?>\s*(.*?)\s*</POST_DRAFT>",
+    re.DOTALL | re.IGNORECASE,
+)
+ACTION_SCHEDULE_RE = re.compile(
+    r"<POST_SCHEDULE\s+time=[\"']([^\"']+)[\"'](?:\s+photo=[\"']?(1|true|yes)[\"']?)?>\s*(.*?)\s*</POST_SCHEDULE>",
+    re.DOTALL | re.IGNORECASE,
+)
+ACTION_SCHEDULE_LAST_RE = re.compile(
+    r"<POST_SCHEDULE_LAST\s+time=[\"']([^\"']+)[\"']\s*/?>",
+    re.IGNORECASE,
+)
+ACTION_REMEMBER_RE = re.compile(r"<REMEMBER>\s*(.*?)\s*</REMEMBER>", re.DOTALL | re.IGNORECASE)
+ACTION_SEND_DM_RE = re.compile(
+    r"<SEND_DM\s+([^>]+)>\s*(.*?)\s*</SEND_DM>",
+    re.DOTALL | re.IGNORECASE,
+)
+ACTION_SET_CONTACT_RE = re.compile(
+    r"<SET_CONTACT\s+([^>]+?)\s*/?>",
+    re.IGNORECASE,
+)
+
 DEFAULT_BOT_NAME = "Adonis Core"
 
-# Живой, естественный промпт для ЛС без шаблонного «передам Adonis» на каждое слово
 DEFAULT_DM_PROMPT = (
     "Ты — {bot_name}, открытый и дружелюбный ИИ-ассистент Adonis. "
     "Общайся живо, легко и по-человечески (подстраивайся под тон собеседника — на «ты» или «вы»), "
@@ -232,6 +272,80 @@ def guard_public_reply(reply: str) -> str:
     return text
 
 
+def extract_xml_attr(attrs: str, name: str) -> str:
+    """Извлекает значение атрибута вида name="..." или name='...' независимо от порядка атрибутов."""
+    m = re.search(rf"{name}\s*=\s*[\"']([^\"']+)[\"']", attrs or "", re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def prepare_tg_html(text: str) -> str:
+    """Безопасно конвертирует блоки кода, `инлайн-код` и **жирный** в Telegram HTML, сохраняя разрешённые теги."""
+    if not text:
+        return ""
+
+    tokens: List[str] = []
+
+    def _stash_raw(html_fragment: str) -> str:
+        tokens.append(html_fragment)
+        return f"\x00TG_TOK_{len(tokens) - 1}\x00"
+
+    # 1. Сохраняем многострочные блоки кода в <pre> с экранированием содержимого
+    working = FENCED_CODE_RE.sub(
+        lambda m: _stash_raw(f"<pre>{html.escape(m.group(1).strip())}</pre>"),
+        text,
+    )
+    # 2. Сохраняем инлайн-код в <code>
+    working = INLINE_CODE_RE.sub(
+        lambda m: _stash_raw(f"<code>{html.escape(m.group(1))}</code>"),
+        working,
+    )
+    # 3. Конвертируем случайный Markdown **жирный** в <b>
+    working = MD_BOLD_RE.sub(r"<b>\1</b>", working)
+
+    # 4. Сохраняем разрешённые Telegram HTML-теги (экранируя & внутри href)
+    def _stash_tag(match: re.Match) -> str:
+        tag = match.group(0)
+        if tag.lower().startswith("<a "):
+            tag = re.sub(r"&(?!amp;|lt;|gt;|quot;)", "&amp;", tag)
+        return _stash_raw(tag)
+
+    working = ALLOWED_TG_TAG_RE.sub(_stash_tag, working)
+    escaped = html.escape(working)
+
+    for idx, frag in enumerate(tokens):
+        escaped = escaped.replace(f"\x00TG_TOK_{idx}\x00", frag)
+    return escaped
+
+
+def strip_tg_html(text: str) -> str:
+    """Убирает HTML-теги на случай fallback-отправки обычным текстом."""
+    return ALLOWED_TG_TAG_RE.sub("", text or "").strip()
+
+
+def split_text_smart(text: str, limit: int = 3900) -> List[str]:
+    """Разбивает длинный текст по абзацам/строкам, чтобы не рвать слова и HTML-теги."""
+    if not text:
+        return ["(пусто)"]
+    if len(text) <= limit:
+        return [text]
+
+    parts: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut < limit // 3:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 3:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts or ["(пусто)"]
+
+
 def parse_msk_schedule_time(text: str) -> Optional[int]:
     s = text.strip().lower()
     curr = now_msk()
@@ -283,18 +397,22 @@ async def send_long_message(
     text: str,
     parse_mode: Optional[str] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> None:
-    chunk_size = 3950
-    parts = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)] or ["(пусто)"]
+) -> Optional[Message]:
+    parts = split_text_smart(text, limit=3900)
+    last_sent: Optional[Message] = None
     for idx, part in enumerate(parts):
         rm = reply_markup if idx == len(parts) - 1 else None
         try:
-            await bot.send_message(chat_id=chat_id, text=part, parse_mode=parse_mode, reply_markup=rm)
+            last_sent = await bot.send_message(chat_id=chat_id, text=part, parse_mode=parse_mode, reply_markup=rm)
         except TelegramBadRequest:
-            await bot.send_message(chat_id=chat_id, text=part, parse_mode=None, reply_markup=rm)
+            fallback_part = strip_tg_html(part) if parse_mode == ParseMode.HTML else part
+            last_sent = await bot.send_message(
+                chat_id=chat_id, text=fallback_part or "(пусто)", parse_mode=None, reply_markup=rm
+            )
+    return last_sent
 
 
-async def download_photo_bytes(bot: Bot, file_id: str) -> Optional[bytes]:
+async def download_file_bytes(bot: Bot, file_id: str) -> Optional[bytes]:
     try:
         tg_file = await bot.get_file(file_id)
         if not tg_file.file_path:
@@ -303,7 +421,7 @@ async def download_photo_bytes(bot: Bot, file_id: str) -> Optional[bytes]:
         await bot.download_file(tg_file.file_path, destination=buf)
         return buf.getvalue()
     except Exception as e:
-        logger.warning(f"Ошибка загрузки фото {file_id}: {sanitize_error(e)}")
+        logger.warning(f"Ошибка загрузки файла {file_id}: {sanitize_error(e)}")
         return None
 
 
@@ -415,6 +533,12 @@ class Database:
             """
         )
 
+        # Безопасная миграция: добавляем колонку alias (псевдоним контакта) для существующих БД
+        cur_cols = await self.conn.execute("PRAGMA table_info(dm_peers)")
+        existing_cols = {row["name"] for row in await cur_cols.fetchall()}
+        if "alias" not in existing_cols:
+            await self.conn.execute("ALTER TABLE dm_peers ADD COLUMN alias TEXT NOT NULL DEFAULT ''")
+
         defaults = {
             "dm_enabled": "1",
             "dm_wait_seconds": str(DEFAULT_DM_WAIT_SECONDS),
@@ -432,7 +556,6 @@ class Database:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
             )
 
-        # Автомиграция: подставляем дефолтный ТГК, если был 0; обновляем старый шаблонный DM-промпт
         cur = await self.conn.execute("SELECT key, value FROM settings WHERE key IN ('channel_id', 'dm_prompt')")
         for row in await cur.fetchall():
             if row["key"] == "channel_id" and row["value"] == "0" and DEFAULT_CHANNEL_ID:
@@ -440,7 +563,6 @@ class Database:
             if row["key"] == "dm_prompt" and row["value"].startswith(OLD_DM_PROMPT_PREFIX):
                 await self.conn.execute("UPDATE settings SET value = ? WHERE key = 'dm_prompt'", (DEFAULT_DM_PROMPT,))
 
-        # Удаляем устаревший слот ТГЧ и создаём актуальные слоты
         await self.conn.execute("DELETE FROM ai_slots WHERE slot = 'chat'")
         await self.conn.execute("UPDATE ai_slots SET title = 'ТГК (посты)' WHERE slot = 'tgk'")
         for slot_name, cfg in DEFAULT_AI_SLOTS.items():
@@ -566,6 +688,12 @@ class Database:
             rows = await cur.fetchall()
             return [dict(r) for r in reversed(rows)]
 
+    async def delete_memory_fact(self, fact_id: int) -> bool:
+        async with self._lock:
+            cur = await self.conn.execute("DELETE FROM shared_memory WHERE id = ?", (fact_id,))
+            await self.conn.commit()
+            return cur.rowcount > 0
+
     async def clear_memory_facts(self) -> None:
         async with self._lock:
             await self.conn.execute("DELETE FROM shared_memory")
@@ -607,6 +735,12 @@ class Database:
     async def get_draft(self, draft_id: int) -> Optional[Dict[str, Any]]:
         async with self._lock:
             cur = await self.conn.execute("SELECT * FROM post_drafts WHERE id = ?", (draft_id,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_latest_draft(self) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            cur = await self.conn.execute("SELECT * FROM post_drafts ORDER BY id DESC LIMIT 1")
             row = await cur.fetchone()
             return dict(row) if row else None
 
@@ -767,6 +901,94 @@ class Database:
             await self.conn.execute(f"UPDATE dm_peers SET {cols} WHERE peer_id = ?", vals)
             await self.conn.commit()
 
+    async def set_dm_alias(self, peer_id: int, alias: str) -> None:
+        await self.set_dm_peer_fields(peer_id, alias=alias.strip()[:60])
+
+    async def resolve_dm_targets(self, query: str) -> List[Dict[str, Any]]:
+        """Ищет контакт для отправки ЛС по числовому ID, @username, псевдониму или имени (с учётом падежей)."""
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        if re.fullmatch(r"\d+", q):
+            pid = int(q)
+            existing = await self.get_dm_peer(pid)
+            if existing:
+                return [existing]
+            return [
+                {
+                    "peer_id": pid,
+                    "business_connection_id": "",
+                    "username": "",
+                    "full_name": f"ID {pid}",
+                    "alias": "",
+                }
+            ]
+
+        q_clean = q.lstrip("@").strip().lower()
+        if not q_clean:
+            return []
+
+        async with self._lock:
+            cur = await self.conn.execute("SELECT * FROM dm_peers ORDER BY last_activity DESC")
+            all_peers = [dict(r) for r in await cur.fetchall()]
+
+        # 1. Точное совпадение по @username
+        exact_user = [p for p in all_peers if (p.get("username") or "").lower() == q_clean]
+        if exact_user:
+            return exact_user
+
+        # 2. Точное совпадение по псевдониму или имени
+        exact_name = [
+            p
+            for p in all_peers
+            if (p.get("alias") or "").lower() == q_clean or (p.get("full_name") or "").lower() == q_clean
+        ]
+        if exact_name:
+            return exact_name
+
+        # 3. Вхождение подстроки
+        sub = [
+            p
+            for p in all_peers
+            if q_clean in (p.get("alias") or "").lower()
+            or q_clean in (p.get("full_name") or "").lower()
+            or q_clean in (p.get("username") or "").lower()
+        ]
+        if sub:
+            return sub
+
+        # 4. Поиск по основе слова (русские падежи: «Васе» -> «Вася», «Диме» -> «Дима»)
+        if len(q_clean) >= 4:
+            stem = q_clean[:-1] if len(q_clean) <= 5 else q_clean[:-2]
+            stem_matches = []
+            for p in all_peers:
+                haystack = f"{p.get('alias') or ''} {p.get('full_name') or ''}".lower()
+                words = re.findall(r"[а-яёa-z0-9]+", haystack)
+                if any(w.startswith(stem) for w in words):
+                    stem_matches.append(p)
+            if stem_matches:
+                return stem_matches
+
+        return []
+
+    async def list_dm_contacts_for_prompt(self, limit: int = 35) -> str:
+        """Краткий справочник известных контактов ЛС для контекста ИИ в Пульте."""
+        peers = await self.list_dm_peers(limit=limit)
+        if not peers:
+            return "(пока нет сохранённых контактов ЛС)"
+        lines = []
+        for p in peers:
+            parts = [f"ID={p['peer_id']}"]
+            if p.get("alias"):
+                parts.append(f"псевдоним={p['alias']}")
+            if p.get("full_name"):
+                parts.append(f"имя={p['full_name']}")
+            if p.get("username"):
+                parts.append(f"@{p['username']}")
+            lines.append("- " + " | ".join(parts))
+        return "\n".join(lines)
+
     async def blacklist_peer_manual(self, peer_id: int) -> None:
         today = today_msk_str()
         ts = now_ts()
@@ -816,16 +1038,19 @@ class Database:
             )
             await self.conn.commit()
 
-    async def pop_dm_buffer(self, peer_id: int) -> List[Dict[str, Any]]:
+    async def peek_dm_buffer(self, peer_id: int) -> List[Dict[str, Any]]:
         async with self._lock:
             cur = await self.conn.execute(
                 "SELECT * FROM dm_pending_buffer WHERE peer_id = ? ORDER BY id ASC", (peer_id,)
             )
-            rows = [dict(r) for r in await cur.fetchall()]
-            if rows:
-                await self.conn.execute("DELETE FROM dm_pending_buffer WHERE peer_id = ?", (peer_id,))
-                await self.conn.commit()
-            return rows
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_dm_buffer_up_to(self, peer_id: int, max_id: int) -> None:
+        async with self._lock:
+            await self.conn.execute(
+                "DELETE FROM dm_pending_buffer WHERE peer_id = ? AND id <= ?", (peer_id, max_id)
+            )
+            await self.conn.commit()
 
     async def clear_dm_buffer(self, peer_id: int) -> None:
         async with self._lock:
@@ -932,15 +1157,28 @@ class AIRouter:
             raise
 
     @staticmethod
-    def _is_transient_network_error(err: Exception) -> bool:
+    def _is_fast_transient_error(err: Exception) -> bool:
+        if isinstance(err, (asyncio.TimeoutError, TimeoutError)):
+            return False
         s = str(err).lower()
-        return any(code in s for code in ("502", "503", "504", "timeout", "timed out", "temporarily"))
+        return any(code in s for code in ("502", "503", "504", "temporarily"))
+
+    @staticmethod
+    def _is_key_fatal_error(err: Exception) -> bool:
+        s = str(err).lower()
+        return any(code in s for code in ("401", "403", "api_key_invalid", "permission_denied"))
+
+    @staticmethod
+    def _is_model_missing_error(err: Exception) -> bool:
+        s = str(err).lower()
+        return "404" in s or "not found" in s
 
     async def generate(
         self,
         slot: str,
         text_prompt: str,
         images: Optional[List[bytes]] = None,
+        audio_parts: Optional[List[Tuple[bytes, str]]] = None,
         system_instruction: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         response_mime_type: Optional[str] = None,
@@ -964,21 +1202,31 @@ class AIRouter:
         if images:
             for img_bytes in images:
                 contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+        if audio_parts:
+            for audio_bytes, mime in audio_parts:
+                contents.append(genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime))
 
         models_to_try = [slot_cfg["primary_model"]]
         if slot_cfg["fallback_model"] and slot_cfg["fallback_model"] != slot_cfg["primary_model"]:
             models_to_try.append(slot_cfg["fallback_model"])
+        if allow_key_failover and "gemini-3.1-flash-lite" not in models_to_try:
+            models_to_try.append("gemini-3.1-flash-lite")
 
         last_err: Optional[Exception] = None
+        dead_models: set[str] = set()
 
-        for key_id in keys_to_try:
+        for key_idx, key_id in enumerate(keys_to_try):
             client = self.clients[key_id]
             if client is None:
                 continue
             sem = self.semaphores.get(key_id) or asyncio.Semaphore(AI_MAX_CONCURRENCY_PER_KEY)
+            key_broken = False
             async with sem:
                 for model_id in models_to_try:
-                    for attempt in range(2):
+                    if model_id in dead_models:
+                        continue
+                    max_attempts = 2 if key_idx == 0 else 1
+                    for attempt in range(max_attempts):
                         try:
                             text = await asyncio.wait_for(
                                 asyncio.to_thread(
@@ -993,17 +1241,26 @@ class AIRouter:
                                 ),
                                 timeout=AI_HARD_TIMEOUT_SEC,
                             )
+                            if not text:
+                                raise RuntimeError("Пустой ответ от модели")
                             return text, model_id
                         except Exception as e:
                             last_err = e
                             logger.warning(
                                 f"[AI:{slot}] Ключ #{key_id} / {model_id} (поп. {attempt + 1}): {sanitize_error(e)}"
                             )
-                            # При 429 не тратим квоту на повтор в тот же ключ — сразу идём к следующей модели/ключу
-                            if attempt == 0 and self._is_transient_network_error(e):
+                            if self._is_key_fatal_error(e):
+                                key_broken = True
+                                break
+                            if self._is_model_missing_error(e):
+                                dead_models.add(model_id)
+                                break
+                            if attempt == 0 and max_attempts > 1 and self._is_fast_transient_error(e):
                                 await asyncio.sleep(1.2)
                                 continue
                             break
+                    if key_broken:
+                        break
 
         raise RuntimeError(f"Слот {slot} не ответил (проверены ключи {keys_to_try}): {sanitize_error(last_err)}")
 
@@ -1043,6 +1300,7 @@ dp.include_router(router)
 owner_state: Dict[str, Any] = {"action": None, "data": {}}
 dm_debounce_tasks: Dict[int, asyncio.Task] = {}
 dm_peer_locks: Dict[int, asyncio.Lock] = {}
+pending_dm_sends: Dict[str, Dict[str, Any]] = {}
 
 BOT_USERNAME = "Adonis_core_bot"
 BOT_ID = 0
@@ -1082,9 +1340,10 @@ async def process_dm_reply(bot: Bot, peer_id: int) -> None:
                 logger.warning(f"[DM] Нет business_connection_id для peer {peer_id}")
                 return
 
-            buffered = await db.pop_dm_buffer(peer_id)
+            buffered = await db.peek_dm_buffer(peer_id)
             if not buffered:
                 return
+            max_buf_id = int(buffered[-1]["id"])
 
             text_chunks = [b["text"] for b in buffered if b["text"]]
             combined_text = sanitize_user_input("\n".join(text_chunks), DM_MAX_INPUT_CHARS)
@@ -1096,6 +1355,7 @@ async def process_dm_reply(bot: Bot, peer_id: int) -> None:
             bot_name = await db.get_setting("bot_name", DEFAULT_BOT_NAME)
 
             if daily_used >= DM_DAILY_LIMIT or session_used >= DM_SESSION_LIMIT:
+                await db.delete_dm_buffer_up_to(peer_id, max_buf_id)
                 if not peer["limit_notified"]:
                     stub_text = (
                         f"Я ({bot_name}) на сейчас ухожу в тихий режим — "
@@ -1140,7 +1400,7 @@ async def process_dm_reply(bot: Bot, peer_id: int) -> None:
                 remaining_photos = max(0, DM_DAILY_PHOTO_LIMIT - daily_photos)
                 if remaining_photos > 0:
                     for fid in photo_ids[:remaining_photos]:
-                        data = await download_photo_bytes(bot, fid)
+                        data = await download_file_bytes(bot, fid)
                         if data:
                             images_bytes.append(data)
                             photos_used_now += 1
@@ -1205,6 +1465,7 @@ async def process_dm_reply(bot: Bot, peer_id: int) -> None:
             )
 
             reply_text = guard_public_reply(raw_reply)
+            await db.delete_dm_buffer_up_to(peer_id, max_buf_id)
             if not reply_text:
                 return
 
@@ -1282,16 +1543,25 @@ async def on_business_message(message: Message, bot: Bot) -> None:
             old.cancel()
 
         await db.clear_dm_buffer(peer_id)
-        existing = await db.get_dm_peer(peer_id)
-        if existing:
-            await db.set_dm_peer_fields(
-                peer_id,
-                session_active=0,
-                wait_until=0,
-                session_used=0,
-                limit_notified=0,
-                last_activity=now_ts(),
-            )
+
+        # Индексируем собеседника даже если владелец написал первым — чтобы работало «напиши ему в ЛС»
+        chat_full_name = " ".join(
+            part for part in (message.chat.first_name, message.chat.last_name) if part
+        ).strip() or message.chat.title or ""
+        await db.upsert_dm_peer(
+            peer_id=peer_id,
+            business_connection_id=conn_id,
+            username=message.chat.username,
+            full_name=chat_full_name,
+        )
+        await db.set_dm_peer_fields(
+            peer_id,
+            session_active=0,
+            wait_until=0,
+            session_used=0,
+            limit_notified=0,
+            last_activity=now_ts(),
+        )
         if raw_text or photo_fid:
             await db.add_dm_history(peer_id, "owner", raw_text or "[Фото от владельца]")
         logger.info(f"[DM] Перехват диалога с {peer_id} — таймер и сессия сброшены.")
@@ -1325,6 +1595,132 @@ async def on_business_message(message: Message, bot: Bot) -> None:
             logger.info(f"[DM] Таймер {format_duration_short(wait_sec)} для {full_name} ({peer_id}) до {format_msk(fire_at)}")
 
 
+async def send_dm_via_business(
+    bot: Bot,
+    peer_id: int,
+    text: str,
+    photo_file_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Отправляет сообщение (или фото) человеку в ЛС от твоего Business-аккаунта."""
+    peer = await db.get_dm_peer(peer_id)
+    conn_id = (peer.get("business_connection_id") if peer else "") or await db.get_setting("business_conn_id", "")
+    if not conn_id:
+        return (
+            False,
+            "Business Mode пока не подключён (нет business_connection_id). "
+            "Открой Telegram → Настройки → Автоматизация чатов и переподключи бота.",
+        )
+
+    clean_text = (text or "").strip()
+    if not clean_text and not photo_file_id:
+        return False, "Пустой текст сообщения."
+
+    # Отменяем отложенный автоответ для этого человека, раз владелец отправляет вручную
+    old = dm_debounce_tasks.pop(peer_id, None)
+    if old and not old.done():
+        old.cancel()
+    await db.clear_dm_buffer(peer_id)
+
+    try:
+        if photo_file_id:
+            if len(clean_text) <= 1024:
+                await bot.send_photo(
+                    chat_id=peer_id,
+                    photo=photo_file_id,
+                    caption=clean_text or None,
+                    business_connection_id=conn_id,
+                )
+            else:
+                await bot.send_photo(chat_id=peer_id, photo=photo_file_id, business_connection_id=conn_id)
+                for chunk in split_text_smart(clean_text, limit=4000):
+                    await bot.send_message(chat_id=peer_id, text=chunk, business_connection_id=conn_id)
+        else:
+            for chunk in split_text_smart(clean_text, limit=4000):
+                await bot.send_message(chat_id=peer_id, text=chunk, business_connection_id=conn_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        err_s = sanitize_error(e)
+        if any(k in err_s.upper() for k in ("BUSINESS_PEER_INVALID", "CHAT NOT FOUND", "USER_IS_BLOCKED")):
+            return (
+                False,
+                f"Telegram не дал написать пользователю {peer_id} через Business Mode: "
+                f"убедись, что с ним уже есть диалог и он входит в список чатов «Автоматизации чатов» ({err_s}).",
+            )
+        return False, f"Ошибка отправки в ЛС ({peer_id}): {err_s}"
+    except Exception as e:
+        return False, f"Ошибка отправки в ЛС ({peer_id}): {sanitize_error(e)}"
+
+    if not peer:
+        peer = await db.upsert_dm_peer(peer_id, conn_id, None, f"ID {peer_id}")
+    await db.set_dm_peer_fields(
+        peer_id,
+        business_connection_id=conn_id,
+        session_active=0,
+        wait_until=0,
+        session_used=0,
+        limit_notified=0,
+        last_activity=now_ts(),
+    )
+    await db.add_dm_history(peer_id, "owner", clean_text or "[Фото от владельца]")
+
+    label = peer.get("alias") or peer.get("full_name") or f"ID {peer_id}"
+    uname = f" (@{peer['username']})" if peer.get("username") else ""
+    return True, f"Отправлено в ЛС → {label}{uname} [ID {peer_id}]"
+
+
+def _cleanup_pending_dm_sends() -> None:
+    cutoff = now_ts() - 3600
+    stale = [k for k, v in pending_dm_sends.items() if v.get("created_at", 0) < cutoff]
+    for k in stale:
+        pending_dm_sends.pop(k, None)
+
+
+async def handle_dm_send_request(
+    bot: Bot,
+    target_query: str,
+    text: str,
+    photo_file_id: Optional[str] = None,
+) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Находит получателя по ID/@username/имени и отправляет сообщение (или просит уточнить при совпадении имён)."""
+    matches = await db.resolve_dm_targets(target_query)
+
+    if not matches:
+        return (
+            f"❌ Не нашёл контакт <b>{html.escape(target_query)}</b> в базе ЛС.\n"
+            f"<i>Telegram не даёт ботам искать новых людей по @username. "
+            f"Перешли мне любое сообщение от этого человека, добавь его в «💬 Чаты ЛС → ➕ Добавить контакт» "
+            f"или укажи числовой ID.</i>",
+            None,
+        )
+
+    if len(matches) == 1:
+        ok, res_msg = await send_dm_via_business(bot, int(matches[0]["peer_id"]), text, photo_file_id)
+        return (f"{'✉️ ✅' if ok else '❌'} {html.escape(res_msg)}", None)
+
+    # Несколько похожих контактов — показываем кнопки выбора, чтобы не отправить не тому
+    _cleanup_pending_dm_sends()
+    token = f"{now_ts()}_{len(pending_dm_sends)}"
+    pending_dm_sends[token] = {
+        "text": text,
+        "photo_fid": photo_file_id,
+        "created_at": now_ts(),
+    }
+    rows: List[List[InlineKeyboardButton]] = []
+    for m in matches[:6]:
+        pid = int(m["peer_id"])
+        name_part = m.get("alias") or m.get("full_name") or f"ID {pid}"
+        u_part = f" (@{m['username']})" if m.get("username") else ""
+        rows.append(
+            [InlineKeyboardButton(text=f"👤 {name_part}{u_part}"[:45], callback_data=f"dm_pick_send:{token}:{pid}")]
+        )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"dm_pick_cancel:{token}")])
+    return (
+        f"🔎 Нашлось несколько контактов по запросу <b>{html.escape(target_query)}</b>.\n"
+        f"Текст: <i>{html.escape(truncate_text(text, 200))}</i>\n"
+        f"Выбери, кому отправить:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 # ===========================
 # КАНАЛ (ТГК)
 # ===========================
@@ -1334,18 +1730,34 @@ async def publish_to_channel(bot: Bot, text: str, photo_file_id: Optional[str] =
     if not channel_id:
         return False, "Не задан ID канала (ТГК). Привяжи его в «📢 Привязка ТГК» или командой /get_id в канале."
 
+    formatted = prepare_tg_html(text)
+    plain = strip_tg_html(text)
+
     try:
         if photo_file_id:
-            if len(text) <= 1024:
-                sent = await bot.send_photo(chat_id=channel_id, photo=photo_file_id, caption=text)
+            if len(formatted) <= 1024:
+                try:
+                    sent = await bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo_file_id,
+                        caption=formatted,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramBadRequest:
+                    sent = await bot.send_photo(
+                        chat_id=channel_id,
+                        photo=photo_file_id,
+                        caption=plain[:1024],
+                    )
             else:
-                sent = await bot.send_photo(chat_id=channel_id, photo=photo_file_id, caption=text[:1020] + "...")
-                await bot.send_message(chat_id=channel_id, text=text[1020:])
+                sent = await bot.send_photo(chat_id=channel_id, photo=photo_file_id)
+                await send_long_message(bot, channel_id, formatted, parse_mode=ParseMode.HTML)
         else:
-            sent = await bot.send_message(chat_id=channel_id, text=text)
+            sent = await send_long_message(bot, channel_id, formatted, parse_mode=ParseMode.HTML)
 
-        await db.save_channel_post(sent.message_id, text, has_photo=bool(photo_file_id))
-        return True, f"Пост опубликован в ТГК (msg_id={sent.message_id})."
+        msg_id = sent.message_id if sent else 0
+        await db.save_channel_post(msg_id or None, plain, has_photo=bool(photo_file_id))
+        return True, f"Пост опубликован в ТГК (msg_id={msg_id})."
     except Exception as e:
         return False, f"Ошибка публикации в ТГК: {sanitize_error(e)}"
 
@@ -1409,8 +1821,8 @@ async def render_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         f"📢 Канал ТГК: <code>{ch_id}</code> | 🚀 Автопилот: {'🟢' if auto_on else '🔴'}\n"
         f"🌐 Прокси: <code>{html.escape(proxy_label)}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Пиши сюда текст или фото — отвечу как личный ассистент.\n"
-        f"/remember факт — в общую память • /clear — очистить диалог</i>"
+        f"<i>Пиши текстом, кидай фото, пересылай посты/сообщения контактов или записывай голосовые — пойму и сделаю сам.\n"
+        f"Пример: «напиши Васе / @юз, что скоро буду» • /send • /remember • /clear</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1443,6 +1855,22 @@ async def render_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         ]
     )
     return text, kb
+
+
+async def render_sched_menu() -> Tuple[str, InlineKeyboardMarkup]:
+    items = await db.get_pending_scheduled_posts()
+    if not items:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")]])
+        return "📋 <b>Отложенные посты</b>\n\nОчередь пуста.", kb
+
+    lines = ["📋 <b>Отложенные посты (МСК):</b>\n"]
+    rows = []
+    for it in items:
+        preview = strip_tg_html(it["text"])
+        lines.append(f"• <b>#{it['id']}</b> [{format_msk(it['publish_at'])}]: {html.escape(truncate_text(preview, 70))}")
+        rows.append([InlineKeyboardButton(text=f"❌ Отменить #{it['id']}", callback_data=f"sched_cancel:{it['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def render_dm_timer_menu() -> Tuple[str, InlineKeyboardMarkup]:
@@ -1489,7 +1917,7 @@ async def render_models_table() -> Tuple[str, InlineKeyboardMarkup]:
         th = s["thinking_level"][:3]
         lines.append(f"{sn:<6}|#{s['key_id']:<2}|{pm:<19}|{fm:<19}|{th}")
     lines.append("</pre>")
-    lines.append("<i>При лимите (429) на одном ключе бот автоматически страхуется другими свободными ключами.</i>")
+    lines.append("<i>При 429/503 бот автоматически страхуется другими ключами и резервной моделью.</i>")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1540,17 +1968,23 @@ async def render_dm_peers_menu() -> Tuple[str, InlineKeyboardMarkup]:
     if not peers:
         text = "💬 <b>Чаты ЛС (Business Mode)</b>\n\nПока никто не писал через подключённый Business Mode."
     else:
-        text = "💬 <b>Собеседники в ЛС</b>\nВыбери диалог для просмотра истории, ЧС или сброса лимитов:"
+        text = "💬 <b>Собеседники и контакты ЛС</b>\nВыбери диалог, чтобы написать, задать псевдоним, глянуть историю или ЧС:"
         for p in peers:
             st = (
                 "🚫"
                 if p["is_blacklisted"]
                 else ("🟢" if p["session_active"] else ("⏳" if p["wait_until"] else "⚪"))
             )
-            label = f"{st} {p['full_name'][:20]} ({p['daily_used']}/{DM_DAILY_LIMIT})"
+            display_name = p.get("alias") or p["full_name"]
+            label = f"{st} {display_name[:20]} ({p['daily_used']}/{DM_DAILY_LIMIT})"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"dm_peer:{p['peer_id']}")])
 
-    buttons.append([InlineKeyboardButton(text="🚫 Добавить ID в ЧС вручную", callback_data="dm_bl_manual")])
+    buttons.append(
+        [
+            InlineKeyboardButton(text="➕ Добавить контакт", callback_data="dm_add_contact"),
+            InlineKeyboardButton(text="🚫 ID в ЧС", callback_data="dm_bl_manual"),
+        ]
+    )
     buttons.append([InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1563,9 +1997,11 @@ async def render_dm_peer_card(peer_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         )
 
     uname = f"@{p['username']}" if p["username"] else "нет юзернейма"
+    alias_line = f"Псевдоним: <b>{html.escape(p['alias'])}</b>\n" if p.get("alias") else ""
     wait_txt = format_msk(p["wait_until"]) if p["wait_until"] else "нет"
     text = (
         f"👤 <b>{html.escape(p['full_name'])}</b> ({html.escape(uname)})\n"
+        f"{alias_line}"
         f"ID: <code>{peer_id}</code>\n"
         f"Чёрный список: {'🚫 ДА (бот молчит)' if p['is_blacklisted'] else '✅ НЕТ'}\n"
         f"Сессия: {'🟢 Активна' if p['session_active'] else '⚪ Ждёт'} | Таймер: {wait_txt}\n"
@@ -1574,6 +2010,10 @@ async def render_dm_peer_card(peer_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     bl_text = "✅ Убрать из ЧС" if p["is_blacklisted"] else "🚫 В чёрный список"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✉️ Написать в ЛС", callback_data=f"dm_send_btn:{peer_id}"),
+                InlineKeyboardButton(text="🏷 Задать имя", callback_data=f"dm_alias_btn:{peer_id}"),
+            ],
             [
                 InlineKeyboardButton(text="📜 История", callback_data=f"dm_hist:{peer_id}"),
                 InlineKeyboardButton(text="🧹 Забыть чат", callback_data=f"dm_clear_hist:{peer_id}"),
@@ -1590,38 +2030,13 @@ async def render_dm_peer_card(peer_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 
 async def render_memory_menu() -> Tuple[str, InlineKeyboardMarkup]:
     facts = await db.get_memory_facts(limit=15)
-    bot_name = await db.get_setting("bot_name", DEFAULT_BOT_NAME)
-    facts_txt = (
-        "\n".join(f"<b>{f['id']}.</b> {html.escape(f['content'])}" for f in facts)
-        if facts
-        else "<i>Пока пусто — добавь факты, их сразу увидят ТГК, Пульт и ЛС.</i>"
-    )
-    text = (
-        f"🧠 <b>Память, имя и стиль</b>\n"
-        f"Имя ассистента: <b>{html.escape(bot_name)}</b>\n\n"
-        f"<b>Общие факты ({len(facts)}):</b>\n{facts_txt}"
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Добавить факт", callback_data="mem_add"),
-                InlineKeyboardButton(text="🗑 Очистить факты", callback_data="mem_clear"),
-            ],
-            [
-                InlineKeyboardButton(text="📘 Стиль ТГК", callback_data="edit_tgk_guide"),
-                InlineKeyboardButton(text="🎭 Характер в ЛС", callback_data="edit_dm_prompt"),
-            ],
-            [
-                InlineKeyboardButton(text="🏷 Сменить имя", callback_data="edit_bot_name"),
-                InlineKeyboardButton(text="🧹 Очистить Пульт", callback_data="clear_owner_hist"),
-            ],
-            [InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")],
-        ]
-    )
-    return text, kb
-
-
-async def generate_post_draft(idea: str, photo_bytes: Optional[bytes], edit_note: str = "", prev_text: str = "") -> str:
+async def generate_post_draft(
+    idea: str,
+    photo_bytes: Optional[bytes],
+    edit_note: str = "",
+    prev_text: str = "",
+    audio_parts: Optional[List[Tuple[bytes, str]]] = None,
+) -> str:
     shared_ctx = await ai.build_shared_context()
     recent_posts = await db.get_recent_posts(limit=8)
     examples = "\n---\n".join(truncate_text(p["text"], 400) for p in recent_posts) or "(пока нет прошлых постов)"
@@ -1629,26 +2044,34 @@ async def generate_post_draft(idea: str, photo_bytes: Optional[bytes], edit_note
     sys_inst = (
         "Ты — контент-мейкер и редактор Telegram-канала Adonis.\n"
         "Пиши готовый текст поста без вступлений вроде «Вот вариант поста:» и без названия ИИ-модели.\n"
+        "Для оформления используй HTML-теги Telegram: <b>жирный</b>, <i>курсив</i>, "
+        "<blockquote>цитата главной мысли</blockquote>, <tg-spoiler>спойлер</tg-spoiler> (НЕ используй Markdown-звёздочки **).\n"
         "Ориентируйся на методичку канала и стиль прошлых постов.\n\n"
         f"--- ОБЩАЯ ПАМЯТЬ И МЕТОДИЧКА ---\n{shared_ctx}"
     )
-    if edit_note and prev_text:
+    if prev_text and (edit_note or audio_parts):
         prompt = (
             f"Исходная идея: {idea}\n\n"
             f"Текущий черновик:\n{prev_text}\n\n"
-            f"Правки от автора:\n{edit_note}\n\n"
+            f"Правки от автора:\n{edit_note or '[Правки продиктованы в голосовом сообщении]'}\n\n"
             f"Перепиши пост с учётом правок."
         )
     else:
+        default_idea = (
+            "Прослушай голосовое сообщение и напиши по нему пост в стиле канала."
+            if audio_parts
+            else "Напиши интересный пост по прикреплённой картинке."
+        )
         prompt = (
             f"Примеры прошлых постов канала для понимания стиля:\n{examples}\n\n"
-            f"Задача / идея нового поста:\n{idea or 'Напиши интересный пост по прикреплённой картинке.'}"
+            f"Задача / идея нового поста:\n{idea or default_idea}"
         )
 
     text, _ = await ai.generate(
         slot="tgk",
         text_prompt=prompt,
         images=[photo_bytes] if photo_bytes else None,
+        audio_parts=audio_parts or None,
         system_instruction=sys_inst,
     )
     return text
@@ -1673,19 +2096,30 @@ async def show_draft_preview(bot: Bot, draft_id: int) -> None:
         ]
     )
     header = "📝 <b>Предпросмотр поста в ТГК:</b>\n\n"
+    body_html = prepare_tg_html(draft["text"])
     if draft["photo_file_id"]:
-        caption = header + html.escape(draft["text"])
+        caption = header + body_html
         if len(caption) <= 1024:
-            await bot.send_photo(OWNER_ID, draft["photo_file_id"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+            try:
+                await bot.send_photo(
+                    OWNER_ID, draft["photo_file_id"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb
+                )
+            except TelegramBadRequest:
+                await bot.send_photo(
+                    OWNER_ID,
+                    draft["photo_file_id"],
+                    caption=f"📝 Предпросмотр поста в ТГК:\n\n{strip_tg_html(draft['text'])[:980]}",
+                    reply_markup=kb,
+                )
         else:
             await bot.send_photo(OWNER_ID, draft["photo_file_id"])
             await send_long_message(bot, OWNER_ID, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
-        await send_long_message(bot, OWNER_ID, header + html.escape(draft["text"]), parse_mode=ParseMode.HTML, reply_markup=kb)
+        await send_long_message(bot, OWNER_ID, header + body_html, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ===========================
-# КОМАНДЫ И ОБРАБОТЧИКИ ВЛАДЕЛЬЦА
+# КОМАНДЫ ВЛАДЕЛЬЦА
 # ===========================
 
 @router.message(F.chat.type == ChatType.PRIVATE, Command("start", "panel"))
@@ -1738,6 +2172,45 @@ async def cmd_remember(message: Message) -> None:
     await message.answer(f"🧠 Запомнил в общую память (#{fid}) — теперь это знают ТГК, Пульт и ЛС.")
 
 
+@router.message(F.chat.type == ChatType.PRIVATE, Command("forget"))
+async def cmd_forget(message: Message) -> None:
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    arg = (message.text or "").replace("/forget", "", 1).strip()
+    if not arg.isdigit():
+        await message.answer("Укажи номер факта из «🧠 Память и стиль», например: <code>/forget 3</code>", parse_mode=ParseMode.HTML)
+        return
+    deleted = await db.delete_memory_fact(int(arg))
+    if deleted:
+        await message.answer(f"🗑 Факт #{arg} удалён из общей памяти.")
+    else:
+        await message.answer(f"Факт #{arg} не найден.")
+
+
+@router.message(F.chat.type == ChatType.PRIVATE, Command("send"))
+async def cmd_send(message: Message, bot: Bot) -> None:
+    if not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "✉️ <b>Мгновенная отправка в ЛС (0 трат ИИ):</b>\n"
+            "<code>/send @username Привет, скоро буду</code>\n"
+            "<code>/send 123456789 Скинь файл</code>\n"
+            "<code>/send Вася Задерживаюсь на 10 мин</code>\n\n"
+            "<i>Или просто пиши мне в чат обычной фразой: «напиши Васе в лс, что я скоро буду».</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    res_html, kb = await handle_dm_send_request(bot, parts[1], parts[2])
+    await message.answer(res_html, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ===========================
+# CALLBACK-КНОПКИ
+# ===========================
+
 @router.callback_query()
 async def on_callback(cb: CallbackQuery, bot: Bot) -> None:
     if not cb.from_user or cb.from_user.id != OWNER_ID:
@@ -1745,6 +2218,9 @@ async def on_callback(cb: CallbackQuery, bot: Bot) -> None:
         return
 
     data = cb.data or ""
+    if not cb.message:
+        await cb.answer()
+        return
 
     try:
         if data == "back_main":
@@ -1824,6 +2300,59 @@ async def on_callback(cb: CallbackQuery, bot: Bot) -> None:
             await cb.message.answer(
                 "🚫 Введи числовой Telegram ID пользователя для добавления в ЧС автоответов ЛС.\nОтмена: /cancel"
             )
+
+        elif data == "dm_add_contact":
+            owner_state["action"] = "dm_add_contact"
+            await cb.message.answer(
+                "➕ <b>Добавление контакта ЛС</b>\n\n"
+                "Способ 1: просто <b>перешли мне любое сообщение</b> от этого человека.\n"
+                "Способ 2: напиши <code>ID Имя</code> или <code>ID @username Имя</code> "
+                "(например: <code>123456789 @vasya Вася</code>).\nОтмена: /cancel",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data.startswith("dm_send_btn:"):
+            pid = int(data.split(":")[1])
+            p = await db.get_dm_peer(pid)
+            name = (p.get("alias") or p.get("full_name")) if p else f"ID {pid}"
+            owner_state["action"] = "dm_send_msg"
+            owner_state["data"] = {"peer_id": pid}
+            await cb.message.answer(
+                f"✉️ Отправь текст (или фото с подписью), который нужно переслать в ЛС → <b>{html.escape(name)}</b>.\n"
+                f"Отмена: /cancel",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data.startswith("dm_alias_btn:"):
+            pid = int(data.split(":")[1])
+            owner_state["action"] = "dm_set_alias"
+            owner_state["data"] = {"peer_id": pid}
+            await cb.message.answer(
+                "🏷 Введи короткое имя/псевдоним для этого контакта (например: <code>Вася</code> или <code>Дизайнер</code>).\n"
+                "Отправь <code>-</code> чтобы очистить. Отмена: /cancel",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data.startswith("dm_pick_send:"):
+            _, token, pid_str = data.split(":", 2)
+            item = pending_dm_sends.pop(token, None)
+            if not item:
+                await cb.answer("Запрос устарел", show_alert=True)
+                return
+            ok, res_msg = await send_dm_via_business(bot, int(pid_str), item["text"], item.get("photo_fid"))
+            await cb.message.edit_text(
+                f"{'✉️ ✅' if ok else '❌'} {html.escape(res_msg)}",
+                parse_mode=ParseMode.HTML,
+            )
+            await cb.answer("Готово!" if ok else "Ошибка")
+            return
+
+        elif data.startswith("dm_pick_cancel:"):
+            token = data.split(":", 1)[1]
+            pending_dm_sends.pop(token, None)
+            await cb.message.edit_text("❌ Отправка в ЛС отменена.")
+            await cb.answer()
+            return
 
         elif data.startswith("dm_peer:"):
             pid = int(data.split(":")[1])
@@ -1988,26 +2517,14 @@ async def on_callback(cb: CallbackQuery, bot: Bot) -> None:
             return
 
         elif data == "menu_sched":
-            items = await db.get_pending_scheduled_posts()
-            if not items:
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")]])
-                await cb.message.edit_text("📋 <b>Отложенные посты</b>\n\nОчередь пуста.", parse_mode=ParseMode.HTML, reply_markup=kb)
-            else:
-                lines = ["📋 <b>Отложенные посты (МСК):</b>\n"]
-                rows = []
-                for it in items:
-                    lines.append(f"• <b>#{it['id']}</b> [{format_msk(it['publish_at'])}]: {html.escape(truncate_text(it['text'], 70))}")
-                    rows.append([InlineKeyboardButton(text=f"❌ Отменить #{it['id']}", callback_data=f"sched_cancel:{it['id']}")])
-                rows.append([InlineKeyboardButton(text="⬅️ В пульт", callback_data="back_main")])
-                await cb.message.edit_text(
-                    "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-                )
+            text, kb = await render_sched_menu()
+            await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
         elif data.startswith("sched_cancel:"):
             sid = int(data.split(":")[1])
             await db.set_scheduled_status(sid, "cancelled")
             await cb.answer("❌ Отложка отменена")
-            text, kb = await render_main_panel()
+            text, kb = await render_sched_menu()
             await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
@@ -2078,6 +2595,10 @@ async def on_callback(cb: CallbackQuery, bot: Bot) -> None:
     await cb.answer()
 
 
+# ===========================
+# ЛИЧНЫЙ ПУЛЬТ ВЛАДЕЛЬЦА
+# ===========================
+
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def on_owner_private_message(message: Message, bot: Bot) -> None:
     if not message.from_user or message.from_user.id != OWNER_ID:
@@ -2085,15 +2606,93 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
 
     text = (message.text or message.caption or "").strip()
     photo_fid = message.photo[-1].file_id if message.photo else None
+    voice_fid = message.voice.file_id if message.voice else None
+    is_forwarded = message.forward_origin is not None
     action = owner_state.get("action")
 
-    if action == "add_model_manual":
-        if text:
-            await db.add_custom_model(text)
+    # Авто-индексация контакта, если владелец переслал сообщение от конкретного пользователя
+    forwarded_user_note = ""
+    if isinstance(message.forward_origin, MessageOriginUser):
+        fu = message.forward_origin.sender_user
+        if fu and fu.id != OWNER_ID and not fu.is_bot:
+            await db.upsert_dm_peer(fu.id, None, fu.username, fu.full_name)
+            u_tag = f" (@{fu.username})" if fu.username else ""
+            forwarded_user_note = f"[Автор пересланного сообщения: {fu.full_name}{u_tag}, ID={fu.id} — сохранён в контактах]"
+
+    if action == "dm_add_contact":
+        if isinstance(message.forward_origin, MessageOriginUser):
+            fu = message.forward_origin.sender_user
+            if fu and fu.id != OWNER_ID and not fu.is_bot:
+                await db.upsert_dm_peer(fu.id, None, fu.username, fu.full_name)
+                reset_owner_state()
+                u_tag = f" (@{fu.username})" if fu.username else ""
+                await message.answer(
+                    f"✅ Контакт добавлен: <b>{html.escape(fu.full_name)}</b>{html.escape(u_tag)} (<code>{fu.id}</code>).",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+        if is_forwarded:
+            await message.answer(
+                "❌ У этого пользователя в настройках приватности скрыта ссылка на аккаунт при пересылке.\n"
+                "Добавь его вручную: <code>ID Имя</code> (например <code>123456789 Вася</code>) или /cancel.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        m_contact = re.match(r"^(\d+)(?:\s+@?([A-Za-z0-9_]{4,32}))?(?:\s+(.+))?$", text)
+        if not m_contact:
+            await message.answer(
+                "❌ Формат: <code>123456789 Вася</code> или <code>123456789 @vasya Вася</code> (или перешли сообщение от человека).\n"
+                "Отмена: /cancel",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        cid = int(m_contact.group(1))
+        uname = m_contact.group(2) or ""
+        alias = (m_contact.group(3) or "").strip()
+        await db.upsert_dm_peer(cid, None, uname, alias or f"ID {cid}")
+        if alias:
+            await db.set_dm_alias(cid, alias)
+        reset_owner_state()
+        await message.answer(
+            f"✅ Контакт <code>{cid}</code> ({html.escape(alias or uname or 'без имени')}) сохранён!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "dm_send_msg":
+        pid = owner_state["data"].get("peer_id")
+        if not pid:
             reset_owner_state()
-            await message.answer(f"✅ Модель <code>{html.escape(text)}</code> добавлена.", parse_mode=ParseMode.HTML)
-            t, kb = await render_models_table()
-            await message.answer(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        if not text and not photo_fid:
+            await message.answer("❌ Пришли текст или фото с подписью (или /cancel).")
+            return
+        reset_owner_state()
+        ok, res_msg = await send_dm_via_business(bot, int(pid), text, photo_fid)
+        await message.answer(f"{'✉️ ✅' if ok else '❌'} {html.escape(res_msg)}", parse_mode=ParseMode.HTML)
+        return
+
+    if action == "dm_set_alias":
+        pid = owner_state["data"].get("peer_id")
+        if not pid or not text:
+            await message.answer("❌ Введи текст псевдонима (или <code>-</code> для очистки, /cancel для отмены).", parse_mode=ParseMode.HTML)
+            return
+        new_alias = "" if text == "-" else text
+        await db.set_dm_alias(int(pid), new_alias)
+        reset_owner_state()
+        t, kb = await render_dm_peer_card(int(pid))
+        await message.answer(f"✅ Псевдоним обновлён.\n\n{t}", parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if action == "add_model_manual":
+        if not text:
+            await message.answer("❌ Отправь текстовый ID модели (или /cancel).")
+            return
+        await db.add_custom_model(text)
+        reset_owner_state()
+        await message.answer(f"✅ Модель <code>{html.escape(text)}</code> добавлена.", parse_mode=ParseMode.HTML)
+        t, kb = await render_models_table()
+        await message.answer(t, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if action == "dm_bl_manual":
@@ -2107,34 +2706,42 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
         return
 
     if action == "mem_add":
-        if text:
-            fid = await db.add_memory_fact(text)
-            reset_owner_state()
-            await message.answer(f"🧠 Факт #{fid} добавлен в общую память.")
+        if not text:
+            await message.answer("❌ Напиши факт текстом (или /cancel).")
+            return
+        fid = await db.add_memory_fact(text)
+        reset_owner_state()
+        await message.answer(f"🧠 Факт #{fid} добавлен в общую память.")
         return
 
     if action == "edit_tgk_guide":
-        if text:
-            await db.set_setting("tgk_guide", text)
-            reset_owner_state()
-            await message.answer("✅ Стиль и методичка ТГК обновлены.")
+        if not text:
+            await message.answer("❌ Отправь текст методички (или /cancel).")
+            return
+        await db.set_setting("tgk_guide", text)
+        reset_owner_state()
+        await message.answer("✅ Стиль и методичка ТГК обновлены.")
         return
 
     if action == "edit_dm_prompt":
-        if text:
-            await db.set_setting("dm_prompt", text)
-            reset_owner_state()
-            await message.answer("✅ Характер ассистента для ЛС обновлён.")
+        if not text:
+            await message.answer("❌ Отправь текст системного промпта (или /cancel).")
+            return
+        await db.set_setting("dm_prompt", text)
+        reset_owner_state()
+        await message.answer("✅ Характер ассистента для ЛС обновлён.")
         return
 
     if action == "edit_bot_name":
-        if text:
-            await db.set_setting("bot_name", text)
-            reset_owner_state()
-            await message.answer(
-                f"✅ Новое имя бота: <b>{html.escape(text)}</b> — теперь он будет представляться им в ЛС.",
-                parse_mode=ParseMode.HTML,
-            )
+        if not text:
+            await message.answer("❌ Напиши новое имя текстом (или /cancel).")
+            return
+        await db.set_setting("bot_name", text)
+        reset_owner_state()
+        await message.answer(
+            f"✅ Новое имя бота: <b>{html.escape(text)}</b> — теперь он будет представляться им в ЛС.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if action and action.startswith("bind_manual:"):
@@ -2149,11 +2756,21 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
         return
 
     if action == "create_post":
+        if not text and not photo_fid and not voice_fid:
+            await message.answer("❌ Пришли текст идеи, фото или голосовое сообщение (или /cancel).")
+            return
         reset_owner_state()
         status_msg = await message.answer("⏳ Генерирую пост в стиле канала...")
-        photo_bytes = await download_photo_bytes(bot, photo_fid) if photo_fid else None
+        photo_bytes = await download_file_bytes(bot, photo_fid) if photo_fid else None
+        post_audio: List[Tuple[bytes, str]] = []
+        if voice_fid:
+            vb = await download_file_bytes(bot, voice_fid)
+            if vb:
+                post_audio.append((vb, "audio/ogg"))
         try:
-            generated = await generate_post_draft(idea=text, photo_bytes=photo_bytes)
+            generated = await generate_post_draft(
+                idea=text, photo_bytes=photo_bytes, audio_parts=post_audio or None
+            )
             await status_msg.delete()
         except Exception as e:
             await status_msg.edit_text(f"❌ Ошибка генерации поста: {sanitize_error(e)}")
@@ -2161,13 +2778,21 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
 
         if await db.get_bool("tgk_autopilot", False):
             ok, res_msg = await publish_to_channel(bot, generated, photo_fid)
-            await message.answer(f"🚀 Автопилот: {'✅ ' if ok else '❌ '}{res_msg}\n\n{generated}")
+            await send_long_message(
+                bot,
+                OWNER_ID,
+                f"🚀 <b>Автопилот:</b> {'✅ ' if ok else '❌ '}{html.escape(res_msg)}\n\n{prepare_tg_html(generated)}",
+                parse_mode=ParseMode.HTML,
+            )
         else:
-            did = await db.save_draft(generated, photo_fid, text)
+            did = await db.save_draft(generated, photo_fid, text or "[Голосовая идея]")
             await show_draft_preview(bot, did)
         return
 
     if action == "edit_draft":
+        if not text and not voice_fid:
+            await message.answer("❌ Напиши или продиктуй голосом, что исправить (или /cancel).")
+            return
         did = owner_state["data"].get("draft_id")
         draft = await db.get_draft(did) if did else None
         reset_owner_state()
@@ -2175,13 +2800,19 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
             await message.answer("Черновик не найден.")
             return
         status_msg = await message.answer("⏳ Переписываю черновик...")
-        photo_bytes = await download_photo_bytes(bot, draft["photo_file_id"]) if draft["photo_file_id"] else None
+        photo_bytes = await download_file_bytes(bot, draft["photo_file_id"]) if draft["photo_file_id"] else None
+        edit_audio: List[Tuple[bytes, str]] = []
+        if voice_fid:
+            vb = await download_file_bytes(bot, voice_fid)
+            if vb:
+                edit_audio.append((vb, "audio/ogg"))
         try:
             new_text = await generate_post_draft(
                 idea=draft["idea"] or "",
                 photo_bytes=photo_bytes,
                 edit_note=text,
                 prev_text=draft["text"],
+                audio_parts=edit_audio or None,
             )
             await db.update_draft_text(did, new_text)
             await status_msg.delete()
@@ -2211,36 +2842,219 @@ async def on_owner_private_message(message: Message, bot: Bot) -> None:
         await message.answer(f"⏰ Пост <b>#{sid}</b> поставлен в отложку на <b>{format_msk(pub_ts)}</b>.", parse_mode=ParseMode.HTML)
         return
 
-    if not text and not photo_fid:
+    if not text and not photo_fid and not voice_fid:
         return
 
-    photo_bytes = await download_photo_bytes(bot, photo_fid) if photo_fid else None
+    try:
+        await bot.send_chat_action(chat_id=OWNER_ID, action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    if photo_fid:
+        await db.set_setting("last_owner_photo_fid", photo_fid)
+
+    photo_bytes = await download_file_bytes(bot, photo_fid) if photo_fid else None
+    audio_parts: List[Tuple[bytes, str]] = []
+    if voice_fid:
+        v_bytes = await download_file_bytes(bot, voice_fid)
+        if v_bytes:
+            audio_parts.append((v_bytes, "audio/ogg"))
+
     history = await db.get_owner_history(limit=12)
     hist_str = "\n".join(
         f"{'Adonis' if h['role'] == 'user' else 'Бот'}: {h['text']}" for h in history
     )
     shared_ctx = await ai.build_shared_context()
     bot_name = await db.get_setting("bot_name", DEFAULT_BOT_NAME)
+    latest_draft = await db.get_latest_draft()
+    last_photo_fid = await db.get_setting("last_owner_photo_fid", "")
+    contacts_ctx = await db.list_dm_contacts_for_prompt(limit=35)
+
+    draft_ctx = (
+        f"Последний черновик (#{latest_draft['id']}, фото: {'да' if latest_draft['photo_file_id'] else 'нет'}):\n"
+        f"{truncate_text(latest_draft['text'], 900)}"
+        if latest_draft
+        else "(активного черновика сейчас нет)"
+    )
 
     sys_inst = (
         f"Ты — личный ИИ-ассистент {bot_name}, общаешься напрямую со своим создателем и владельцем Adonis.\n"
-        "Помогай с идеями для ТГК, текстами, анализом фото/скринов и любыми задачами (для владельца ограничений нет).\n"
-        "Если Adonis просит что-то запомнить для всех чатов, напомни, что можно использовать /remember.\n\n"
+        "Помогай с идеями для ТГК, постами, рерайтом пересланных постов, отправкой сообщений людям в ЛС, "
+        "анализом фото/скринов, голосовых и любыми задачами (для владельца ограничений нет).\n\n"
+        "РЕАЛЬНЫЕ ИНСТРУМЕНТЫ (используй специальные теги в ответе):\n"
+        "1. <POST_DRAFT>текст поста</POST_DRAFT> — написать/переписать пост и сначала показать Adonis с кнопками "
+        "(с последним фото: <POST_DRAFT photo=\"1\">...).\n"
+        "2. <POST_PUBLISH>текст поста</POST_PUBLISH> — СРАЗУ опубликовать пост в канал ТГК (с фото: <POST_PUBLISH photo=\"1\">...).\n"
+        "3. <POST_PUBLISH_LAST/> — опубликовать последний черновик без правок.\n"
+        "4. <POST_SCHEDULE time=\"ВРЕМЯ\">текст</POST_SCHEDULE> или <POST_SCHEDULE_LAST time=\"ВРЕМЯ\"/> — поставить в отложку "
+        "(МСК: «18:30», «завтра 12:00», «27.11 15:00», «+2ч»).\n"
+        "5. <SEND_DM target=\"ID_ИЛИ_@ЮЗ_ИЛИ_ИМЯ\">текст сообщения</SEND_DM> — ОТПРАВИТЬ личное сообщение человеку в ЛС "
+        "через Business Mode от аккаунта Adonis (с фото: <SEND_DM target=\"...\" photo=\"1\">...).\n"
+        "   • Если нужный человек есть в списке ИЗВЕСТНЫЕ КОНТАКТЫ ЛС ниже — подставляй в target его точный числовой ID.\n"
+        "   • Если в списке его нет — подставляй ровно тот @username, ID или имя, что назвал Adonis.\n"
+        "   • Если Adonis дал точный текст в кавычках (например, напиши Васе «привет») — отправь его без отсебятины.\n"
+        "   • Если Adonis описал смысл (например, «напиши Диме вежливо, что задерживаюсь») — сформулируй естественно от лица Adonis.\n"
+        "6. <SET_CONTACT target=\"ID_ИЛИ_@ЮЗ\" alias=\"Псевдоним\"/> — сохранить короткое имя для контакта "
+        "(когда Adonis просит запомнить, как зовут человека).\n"
+        "7. <REMEMBER>факт</REMEMBER> — запомнить важный факт в общую память.\n\n"
+        "ПРАВИЛА ОФОРМЛЕНИЯ И ЧЕСТНОСТИ:\n"
+        "- Внутри <POST_...> используй Telegram HTML: <b>жирный</b>, <i>курсив</i>, <blockquote>цитата</blockquote>, "
+        "<tg-spoiler>спойлер</tg-spoiler> (НЕ используй Markdown **).\n"
+        "- Когда вызываешь <POST_PUBLISH>, <POST_SCHEDULE...> или <SEND_DM>, НЕ пиши от себя «Готово, отправил» — "
+        "система сама добавит реальный статус отправки.\n"
+        "- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО говорить, что ты опубликовал пост или отправил ЛС, если ты НЕ вставил соответствующий тег.\n"
+        "- Если Adonis просто общается или спрашивает совет — отвечай обычным текстом без тегов.\n\n"
+        f"--- ИЗВЕСТНЫЕ КОНТАКТЫ ЛС ---\n{contacts_ctx}\n\n"
+        f"--- ПОСЛЕДНИЙ ЧЕРНОВИК ---\n{draft_ctx}\n\n"
         f"--- ОБЩАЯ ПАМЯТЬ ---\n{shared_ctx}"
     )
-    prompt = f"История вашего диалога:\n{hist_str}\n\nНовое сообщение от Adonis:\n{text or '[Фото]'}"
+
+    user_input_desc = text
+    if is_forwarded:
+        prefix = f"[Пересланное сообщение] {forwarded_user_note}".strip()
+        user_input_desc = f"{prefix}\n{user_input_desc}" if user_input_desc else prefix
+    if voice_fid and not user_input_desc:
+        user_input_desc = "[Голосовое сообщение — прослушай аудио и выполни просьбу Adonis]"
+    elif photo_fid and not user_input_desc:
+        user_input_desc = "[Фото]"
+
+    prompt = f"История вашего диалога:\n{hist_str}\n\nНовое сообщение от Adonis:\n{user_input_desc}"
 
     try:
         reply, used_model = await ai.generate(
             slot="owner",
             text_prompt=prompt,
             images=[photo_bytes] if photo_bytes else None,
+            audio_parts=audio_parts or None,
             system_instruction=sys_inst,
         )
-        await db.add_owner_msg("user", text or "[Фото]")
-        await db.add_owner_msg("assistant", reply)
-        # Название модели показывается ТОЛЬКО в личке с владельцем
-        await send_long_message(bot, OWNER_ID, f"{reply}\n\n⚙️ {used_model}")
+
+        executed_logs: List[str] = []
+        pending_pick_kb: Optional[InlineKeyboardMarkup] = None
+        clean_reply = reply
+
+        # 1. Сохранение фактов в общую память
+        for m_mem in ACTION_REMEMBER_RE.finditer(reply):
+            fact = m_mem.group(1).strip()
+            if fact:
+                fid = await db.add_memory_fact(fact)
+                executed_logs.append(f"🧠 Запомнил в общую память (#{fid}): {html.escape(truncate_text(fact, 120))}")
+        clean_reply = ACTION_REMEMBER_RE.sub("", clean_reply)
+
+        # 2. Сохранение псевдонимов контактов
+        for m_scont in ACTION_SET_CONTACT_RE.finditer(reply):
+            attrs = m_scont.group(1)
+            tgt = extract_xml_attr(attrs, "target")
+            alias_val = extract_xml_attr(attrs, "alias")
+            if tgt and alias_val:
+                found = await db.resolve_dm_targets(tgt)
+                if len(found) == 1:
+                    pid = int(found[0]["peer_id"])
+                    await db.upsert_dm_peer(pid, found[0].get("business_connection_id"), found[0].get("username"), found[0].get("full_name"))
+                    await db.set_dm_alias(pid, alias_val)
+                    executed_logs.append(f"🏷 Контакту <code>{pid}</code> задан псевдоним <b>{html.escape(alias_val)}</b>.")
+                else:
+                    executed_logs.append(f"❌ Не удалось однозначно найти контакт «{html.escape(tgt)}» для сохранения имени.")
+        clean_reply = ACTION_SET_CONTACT_RE.sub("", clean_reply)
+
+        # 3. Отправка личных сообщений в ЛС (Business Mode)
+        for m_dm in ACTION_SEND_DM_RE.finditer(reply):
+            attrs, dm_text = m_dm.group(1), m_dm.group(2).strip()
+            tgt = extract_xml_attr(attrs, "target")
+            want_photo = extract_xml_attr(attrs, "photo").lower() in ("1", "true", "yes")
+            if tgt and (dm_text or photo_fid or want_photo):
+                use_photo = photo_fid or (last_photo_fid if want_photo else None)
+                res_html, pick_kb = await handle_dm_send_request(bot, tgt, dm_text, use_photo)
+                executed_logs.append(res_html)
+                if pick_kb:
+                    pending_pick_kb = pick_kb
+        clean_reply = ACTION_SEND_DM_RE.sub("", clean_reply)
+
+        # 4. Мгновенная публикация последнего черновика
+        if ACTION_PUBLISH_LAST_RE.search(reply):
+            clean_reply = ACTION_PUBLISH_LAST_RE.sub("", clean_reply)
+            draft_to_pub = await db.get_latest_draft()
+            if draft_to_pub:
+                ok, res_msg = await publish_to_channel(bot, draft_to_pub["text"], draft_to_pub["photo_file_id"])
+                if ok:
+                    await db.delete_draft(draft_to_pub["id"])
+                executed_logs.append(f"{'✅' if ok else '❌'} {html.escape(res_msg)}")
+            else:
+                executed_logs.append("❌ Активного черновика не найдено — напиши, какой именно текст опубликовать.")
+
+        # 5. Мгновенная публикация нового/отредактированного поста
+        for m_pub in ACTION_PUBLISH_RE.finditer(reply):
+            want_photo, post_text = m_pub.group(1), m_pub.group(2).strip()
+            if post_text:
+                use_photo = photo_fid or (last_photo_fid if want_photo else None)
+                ok, res_msg = await publish_to_channel(bot, post_text, use_photo)
+                executed_logs.append(f"{'✅' if ok else '❌'} {html.escape(res_msg)}")
+        clean_reply = ACTION_PUBLISH_RE.sub("", clean_reply)
+
+        # 6. Отложка последнего черновика
+        for m_sl in ACTION_SCHEDULE_LAST_RE.finditer(reply):
+            time_str = m_sl.group(1).strip()
+            pub_ts = parse_msk_schedule_time(time_str)
+            draft_to_sched = await db.get_latest_draft()
+            if not draft_to_sched:
+                executed_logs.append("❌ Активного черновика для отложки не найдено.")
+            elif not pub_ts:
+                executed_logs.append(f"❌ Не удалось распознать время отложки: «{html.escape(time_str)}».")
+            else:
+                sid = await db.add_scheduled_post(draft_to_sched["text"], draft_to_sched["photo_file_id"], pub_ts)
+                await db.delete_draft(draft_to_sched["id"])
+                executed_logs.append(f"⏰ Черновик поставлен в отложку #{sid} на <b>{format_msk(pub_ts)}</b>.")
+        clean_reply = ACTION_SCHEDULE_LAST_RE.sub("", clean_reply)
+
+        # 7. Отложка нового поста
+        for m_sc in ACTION_SCHEDULE_RE.finditer(reply):
+            time_str, want_photo, post_text = m_sc.group(1).strip(), m_sc.group(2), m_sc.group(3).strip()
+            pub_ts = parse_msk_schedule_time(time_str)
+            if not pub_ts:
+                executed_logs.append(f"❌ Не удалось распознать время отложки: «{html.escape(time_str)}».")
+            elif post_text:
+                use_photo = photo_fid or (last_photo_fid if want_photo else None)
+                sid = await db.add_scheduled_post(post_text, use_photo, pub_ts)
+                executed_logs.append(f"⏰ Пост поставлен в отложку #{sid} на <b>{format_msk(pub_ts)}</b>.")
+        clean_reply = ACTION_SCHEDULE_RE.sub("", clean_reply)
+
+        # 8. Создание черновика с кнопками предпросмотра
+        created_draft_ids: List[int] = []
+        for m_dr in ACTION_DRAFT_RE.finditer(reply):
+            want_photo, post_text = m_dr.group(1), m_dr.group(2).strip()
+            if post_text:
+                use_photo = photo_fid or (last_photo_fid if want_photo else None)
+                did = await db.save_draft(post_text, use_photo, user_input_desc)
+                created_draft_ids.append(did)
+        clean_reply = ACTION_DRAFT_RE.sub("", clean_reply).strip()
+
+        # Сохраняем чистый диалог в историю
+        await db.add_owner_msg("user", user_input_desc)
+        hist_assistant = clean_reply or ""
+        if created_draft_ids:
+            hist_assistant = (hist_assistant + f"\n[Создан черновик #{created_draft_ids[-1]}]").strip()
+        if executed_logs:
+            hist_assistant = (hist_assistant + "\n" + "\n".join(strip_tg_html(x) for x in executed_logs)).strip()
+        await db.add_owner_msg("assistant", hist_assistant or "[Выполнено]")
+
+        # Отправляем отформатированный ответ владельцу
+        out_html_parts: List[str] = []
+        if clean_reply:
+            out_html_parts.append(prepare_tg_html(clean_reply))
+        if executed_logs:
+            out_html_parts.append("\n".join(executed_logs))
+
+        if out_html_parts:
+            full_out = "\n\n".join(out_html_parts) + f"\n\n⚙️ <code>{html.escape(used_model)}</code>"
+            await send_long_message(
+                bot, OWNER_ID, full_out, parse_mode=ParseMode.HTML, reply_markup=pending_pick_kb
+            )
+        elif created_draft_ids:
+            await message.answer(f"⚙️ <code>{html.escape(used_model)}</code>", parse_mode=ParseMode.HTML)
+
+        for did in created_draft_ids:
+            await show_draft_preview(bot, did)
+
     except Exception as e:
         await message.answer(f"❌ Ошибка ответа (слот Пульт): {sanitize_error(e)}")
 
@@ -2307,7 +3121,7 @@ async def main() -> None:
     await db.init()
 
     bot = Bot(
-        token=BOT_TOKEN,
+        token=BOT_TOKEN.strip(),
         default=DefaultBotProperties(parse_mode=None),
     )
 
@@ -2319,13 +3133,28 @@ async def main() -> None:
         f"Прокси={GEMINI_BASE_URL or 'direct'}"
     )
 
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="panel", description="Открыть пульт управления"),
+                BotCommand(command="send", description="Написать человеку в ЛС (@юз/ID/имя)"),
+                BotCommand(command="remember", description="Запомнить факт для всех чатов"),
+                BotCommand(command="forget", description="Удалить факт по номеру"),
+                BotCommand(command="clear", description="Очистить историю диалога Пульта"),
+                BotCommand(command="get_id", description="Узнать и привязать ID канала"),
+                BotCommand(command="cancel", description="Отменить текущее действие"),
+            ]
+        )
+    except Exception:
+        pass
+
     sched_task = asyncio.create_task(background_scheduler(bot))
 
     try:
         await bot.send_message(
             OWNER_ID,
             f"⚡ <b>@{html.escape(BOT_USERNAME)} обновлён и запущен!</b>\n"
-            f"Нажми /panel, чтобы открыть новый пульт.",
+            f"Нажми /panel, чтобы открыть пульт.",
             parse_mode=ParseMode.HTML,
         )
     except (TelegramForbiddenError, TelegramBadRequest):
